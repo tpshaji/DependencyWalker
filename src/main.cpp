@@ -624,6 +624,85 @@ static void ExportLogToFile(HWND hWnd, HWND hLog) {
     pDlg->Release();
 }
 
+static void AppendLastError(HWND hLog, const std::wstring& prefix, DWORD gle) {
+    LPWSTR msgBuf = nullptr;
+    DWORD len = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                               nullptr, gle, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+                               (LPWSTR)&msgBuf, 0, nullptr);
+    if (len && msgBuf) {
+        std::wstring msg(msgBuf, len);
+        // Trim trailing newlines
+        while (!msg.empty() && (msg.back() == L'\r' || msg.back() == L'\n')) msg.pop_back();
+        AppendLog(hLog, prefix + L" GLE=" + std::to_wstring(gle) + L" (" + msg + L")");
+        LocalFree(msgBuf);
+    } else {
+        AppendLog(hLog, prefix + L" GLE=" + std::to_wstring(gle));
+    }
+}
+
+static void DiagnoseRegistrationFailure(HWND hWnd, HWND hLog, const std::wstring& dllPath, bool isUnregister) {
+    if (!hLog || dllPath.empty()) return;
+
+    // 1) Basic file checks
+    DWORD attr = GetFileAttributesW(dllPath.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES) {
+        DWORD gle = GetLastError();
+        AppendLastError(hLog, L"[Detail] DLL not accessible.", gle);
+        return;
+    } else {
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        if (GetFileAttributesExW(dllPath.c_str(), GetFileExInfoStandard, &fad)) {
+            AppendLog(hLog, L"[Detail] DLL size: " + std::to_wstring(((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow) + L" bytes");
+        }
+    }
+
+    // 2) Try to load the DLL (normal load to exercise dependencies)
+    HMODULE mod = LoadLibraryExW(dllPath.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!mod) {
+        DWORD gle = GetLastError();
+        AppendLastError(hLog, L"[Detail] LoadLibraryEx failed.", gle);
+    } else {
+        // 3) Check expected export exists
+        const char* exportName = isUnregister ? "DllUnregisterServer" : "DllRegisterServer";
+        FARPROC proc = GetProcAddress(mod, exportName);
+        if (!proc) {
+            AppendLog(hLog, L"[Detail] Export '" + std::wstring(exportName, exportName + strlen(exportName)) + L"' not found.");
+            // Also check alternative 'DllInstall'
+            FARPROC di = GetProcAddress(mod, "DllInstall");
+            if (di) {
+                AppendLog(hLog, L"[Detail] 'DllInstall' export is present; registration may rely on installer context.");
+            }
+        } else {
+            AppendLog(hLog, L"[Detail] Export '" + std::wstring(exportName, exportName + strlen(exportName)) + L"' is present.");
+        }
+        FreeLibrary(mod);
+    }
+
+    // 4) Dependency resolution (report any that cannot be found via loader search)
+    std::vector<std::wstring> names;
+    std::wstring err;
+    if (peutils::GetImportedDllNames(dllPath, names, err)) {
+        int missing = 0;
+        std::wstring primaryDir = DirName(dllPath);
+        for (const auto& name : names) {
+            std::wstring resolved = ResolvePathWithGetModuleFileName(name, primaryDir);
+            if (resolved.empty()) {
+                if (missing == 0) AppendLog(hLog, L"[Detail] Missing dependency DLLs (not resolved by loader):");
+                AppendLog(hLog, L"          - " + name);
+                ++missing;
+            }
+        }
+        if (missing == 0) {
+            AppendLog(hLog, L"[Detail] All imported DLLs resolved via loader search.");
+        }
+    } else {
+        AppendLog(hLog, L"[Detail] Could not enumerate imports: " + err);
+    }
+
+    // 5) UAC hint already logged elsewhere; add concise reminder
+    AppendLog(hLog, L"[Hint] If access denied persists, try 'Register (Elevated)' or run the app elevated.");
+}
+
 static void PopulateDependencies(HWND hWnd, AppState* app) {
     if (!app || app->selectedDllPath.empty()) return;
 
@@ -750,6 +829,7 @@ static void RegisterSelectedDll(HWND hWnd, AppState* app) {
     } else {
         AppendLog(app->hLog, L"[Warning] Registration failed or returned non-zero.");
         AppendLog(app->hLog, L"          If this is due to permissions, try running the app elevated.");
+        DiagnoseRegistrationFailure(hWnd, app->hLog, app->selectedDllPath, /*isUnregister=*/false);
     }
 }
 
@@ -814,6 +894,7 @@ static void RegisterSelectedDllElevated(HWND hWnd, AppState* app) {
             AppendLog(app->hLog, L"[Info] Captured registry snapshots (before/after). Use 'Registry Update' to view diff.");
         } else {
             AppendLog(app->hLog, L"[Warning] Registration failed or returned non-zero (elevated).");
+            DiagnoseRegistrationFailure(hWnd, app->hLog, app->selectedDllPath, /*isUnregister=*/false);
         }
     } else {
         AppendLog(app->hLog, L"[Info] No process handle returned from ShellExecuteEx.");
@@ -1059,6 +1140,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                     AppendLog(app->hLog, L"[Info] Captured registry snapshots (before/after). Use 'Registry Update' to view diff.");
                 } else {
                     AppendLog(app->hLog, L"[Warning] Unregistration returned non-zero.");
+                    DiagnoseRegistrationFailure(hWnd, app->hLog, app->selectedDllPath, /*isUnregister=*/true);
                 }
             } else {
                 AppendLog(app->hLog, L"[Error] No DLL selected.");
