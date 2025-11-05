@@ -7,6 +7,8 @@
 #include <sstream>
 #include <iomanip>
 #include <winver.h>
+#include <cwctype>
+#include <unordered_set>
 #include "pe_utils.h"
 
 #pragma comment(lib, "Comctl32.lib")
@@ -214,6 +216,151 @@ static std::wstring GetFileCompanyName(const std::wstring& filePath) {
     return L"";
 }
 
+static std::wstring ToLower(const std::wstring& s) {
+    std::wstring out = s;
+    for (auto& ch : out) ch = static_cast<wchar_t>(towlower(ch));
+    return out;
+}
+
+static bool ContainsIC(const std::wstring& haystack, const std::wstring& needle) {
+    if (needle.empty()) return true;
+    std::wstring h = ToLower(haystack);
+    std::wstring n = ToLower(needle);
+    return h.find(n) != std::wstring::npos;
+}
+
+struct RegSearchOptions {
+    REGSAM wow64View;
+    int maxDepth;
+    int maxNodes;
+};
+
+static void SearchRegistryForPathInternal(HKEY root, const std::wstring& subkey, const std::wstring& pathLower,
+                                          const RegSearchOptions& opt, int depth, int& visited,
+                                          std::vector<std::wstring>& out) {
+    if (depth > opt.maxDepth || visited > opt.maxNodes) return;
+
+    HKEY hKey = nullptr;
+    LONG rc = RegOpenKeyExW(root, subkey.c_str(), 0, KEY_READ | KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE | opt.wow64View, &hKey);
+    if (rc != ERROR_SUCCESS) return;
+
+    ++visited;
+
+    // Check default value
+    DWORD type = 0;
+    DWORD cb = 0;
+    if (RegQueryValueExW(hKey, nullptr, nullptr, &type, nullptr, &cb) == ERROR_SUCCESS &&
+        (type == REG_SZ || type == REG_EXPAND_SZ) && cb > sizeof(wchar_t)) {
+        std::vector<wchar_t> buf(cb / sizeof(wchar_t) + 1);
+        if (RegQueryValueExW(hKey, nullptr, nullptr, &type, reinterpret_cast<LPBYTE>(buf.data()), &cb) == ERROR_SUCCESS) {
+            std::wstring val(buf.data());
+            if (ContainsIC(val, pathLower)) {
+                out.push_back(L"HKCR\\" + subkey + L" [(Default)] = " + val);
+            }
+        }
+    }
+
+    // Enumerate values
+    DWORD index = 0;
+    for (;;) {
+        DWORD nameLen = 256;
+        wchar_t nameBuf[256];
+        DWORD typeV = 0;
+        DWORD dataSize = 0;
+        LONG r = RegEnumValueW(hKey, index, nameBuf, &nameLen, nullptr, &typeV, nullptr, &dataSize);
+        if (r == ERROR_NO_MORE_ITEMS) break;
+        if (r == ERROR_MORE_DATA) { // grow buffers and retry
+            std::vector<wchar_t> nameDyn(1024);
+            nameLen = static_cast<DWORD>(nameDyn.size());
+            dataSize = 65536;
+            std::vector<BYTE> dataDyn(dataSize);
+            r = RegEnumValueW(hKey, index, nameDyn.data(), &nameLen, nullptr, &typeV, dataDyn.data(), &dataSize);
+            if (r == ERROR_SUCCESS && (typeV == REG_SZ || typeV == REG_EXPAND_SZ)) {
+                std::wstring val(reinterpret_cast<wchar_t*>(dataDyn.data()));
+                if (ContainsIC(val, pathLower)) {
+                    out.push_back(L"HKCR\\" + subkey + L" [" + std::wstring(nameDyn.data(), nameLen) + L"] = " + val);
+                }
+            }
+            ++index;
+            continue;
+        }
+        if (r == ERROR_SUCCESS) {
+            std::wstring valueName(nameBuf, nameLen);
+            if ((typeV == REG_SZ || typeV == REG_EXPAND_SZ) && dataSize > sizeof(wchar_t)) {
+                std::vector<wchar_t> data(dataSize / sizeof(wchar_t) + 1);
+                DWORD ds = dataSize;
+                if (RegEnumValueW(hKey, index, nameBuf, &nameLen, nullptr, &typeV, reinterpret_cast<LPBYTE>(data.data()), &ds) == ERROR_SUCCESS) {
+                    std::wstring val(data.data());
+                    if (ContainsIC(val, pathLower)) {
+                        out.push_back(L"HKCR\\" + subkey + L" [" + valueName + L"] = " + val);
+                    }
+                }
+            }
+        }
+        ++index;
+    }
+
+    // Enumerate subkeys
+    DWORD subIndex = 0;
+    for (;;) {
+        wchar_t subName[256];
+        DWORD subNameLen = 256;
+        FILETIME ft{};
+        LONG rr = RegEnumKeyExW(hKey, subIndex, subName, &subNameLen, nullptr, nullptr, nullptr, &ft);
+        if (rr == ERROR_NO_MORE_ITEMS) break;
+        if (rr == ERROR_SUCCESS) {
+            std::wstring child = subkey.empty() ? std::wstring(subName, subNameLen)
+                                                : subkey + L"\\" + std::wstring(subName, subNameLen);
+            SearchRegistryForPathInternal(root, child, pathLower, opt, depth + 1, visited, out);
+        }
+        ++subIndex;
+        if (visited > opt.maxNodes) break;
+    }
+
+    RegCloseKey(hKey);
+}
+
+static void SearchRegistryForPath(HKEY root, const std::wstring& subkey, const std::wstring& pathLower,
+                                  const RegSearchOptions& opt, std::vector<std::wstring>& out) {
+    int visited = 0;
+    SearchRegistryForPathInternal(root, subkey, pathLower, opt, 0, visited, out);
+}
+
+static void ListRegistryWritesForDll(const std::wstring& dllPath, HWND hLog) {
+    if (!hLog || dllPath.empty()) return;
+    std::wstring pathLower = ToLower(dllPath);
+
+    std::vector<std::wstring> results;
+    std::unordered_set<std::wstring> seen;
+
+    auto addUnique = [&](const std::vector<std::wstring>& v) {
+        for (const auto& s : v) {
+            if (seen.insert(s).second) results.push_back(s);
+        }
+    };
+
+    // Limit traversal to a reasonable scope to keep UI responsive
+    RegSearchOptions opt64{ KEY_WOW64_64KEY, 4, 20000 };
+    RegSearchOptions opt32{ KEY_WOW64_32KEY, 4, 20000 };
+
+    // Scan HKCR\CLSID and HKCR\TypeLib for references to the DLL path (both 64-bit and 32-bit views)
+    std::vector<std::wstring> tmp;
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"CLSID", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"TypeLib", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"CLSID", pathLower, opt32, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"TypeLib", pathLower, opt32, tmp); addUnique(tmp);
+
+    if (results.empty()) {
+        AppendLog(hLog, L"[Info] No registry entries referencing this DLL were found under HKCR\\CLSID or HKCR\\TypeLib.");
+        return;
+    }
+
+    AppendLog(hLog, L"[Info] Registry entries referencing this DLL path:");
+    for (const auto& line : results) {
+        AppendLog(hLog, L"  - " + line);
+    }
+}
+
 static void PopulateDependencies(HWND hWnd, AppState* app) {
     if (!app || app->selectedDllPath.empty()) return;
 
@@ -325,6 +472,8 @@ static void RegisterSelectedDll(HWND hWnd, AppState* app) {
 
     if (exitCode == 0) {
         AppendLog(app->hLog, L"[Success] Registration completed.");
+        AppendLog(app->hLog, L"[Info] Scanning registry for entries referencing this DLL...");
+        ListRegistryWritesForDll(app->selectedDllPath, app->hLog);
     } else {
         AppendLog(app->hLog, L"[Warning] Registration failed or returned non-zero.");
         AppendLog(app->hLog, L"          If this is due to permissions, try running the app elevated.");
@@ -378,6 +527,8 @@ static void RegisterSelectedDllElevated(HWND hWnd, AppState* app) {
 
         if (exitCode == 0) {
             AppendLog(app->hLog, L"[Success] Registration completed (elevated).");
+            AppendLog(app->hLog, L"[Info] Scanning registry for entries referencing this DLL...");
+            ListRegistryWritesForDll(app->selectedDllPath, app->hLog);
         } else {
             AppendLog(app->hLog, L"[Warning] Registration failed or returned non-zero (elevated).");
         }
