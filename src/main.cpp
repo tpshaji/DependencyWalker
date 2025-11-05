@@ -20,6 +20,7 @@
 #define IDC_LIST         1003
 #define IDC_LOG          1004
 #define IDC_REG_ELEV     1005
+#define IDC_CLEAR_LOG    1006
 
 // Window class name
 static const wchar_t* kClassName = L"DependencyExplorerWnd";
@@ -33,6 +34,7 @@ struct AppState {
     HWND hOpenBtn = nullptr;
     HWND hRegBtn  = nullptr;
     HWND hRegElevBtn = nullptr;
+    HWND hClearLogBtn = nullptr;
 };
 
 static std::wstring DirName(const std::wstring& path) {
@@ -235,7 +237,7 @@ struct RegSearchOptions {
     int maxNodes;
 };
 
-static void SearchRegistryForPathInternal(HKEY root, const std::wstring& subkey, const std::wstring& pathLower,
+static void SearchRegistryForPathInternal(HKEY root, const std::wstring& subkey, const std::wstring& pathLower, const std::wstring& rootLabel,
                                           const RegSearchOptions& opt, int depth, int& visited,
                                           std::vector<std::wstring>& out) {
     if (depth > opt.maxDepth || visited > opt.maxNodes) return;
@@ -255,7 +257,7 @@ static void SearchRegistryForPathInternal(HKEY root, const std::wstring& subkey,
         if (RegQueryValueExW(hKey, nullptr, nullptr, &type, reinterpret_cast<LPBYTE>(buf.data()), &cb) == ERROR_SUCCESS) {
             std::wstring val(buf.data());
             if (ContainsIC(val, pathLower)) {
-                out.push_back(L"HKCR\\" + subkey + L" [(Default)] = " + val);
+                out.push_back(rootLabel + L"\\" + subkey + L" [(Default)] = " + val);
             }
         }
     }
@@ -278,7 +280,7 @@ static void SearchRegistryForPathInternal(HKEY root, const std::wstring& subkey,
             if (r == ERROR_SUCCESS && (typeV == REG_SZ || typeV == REG_EXPAND_SZ)) {
                 std::wstring val(reinterpret_cast<wchar_t*>(dataDyn.data()));
                 if (ContainsIC(val, pathLower)) {
-                    out.push_back(L"HKCR\\" + subkey + L" [" + std::wstring(nameDyn.data(), nameLen) + L"] = " + val);
+                    out.push_back(rootLabel + L"\\" + subkey + L" [" + std::wstring(nameDyn.data(), nameLen) + L"] = " + val);
                 }
             }
             ++index;
@@ -292,7 +294,7 @@ static void SearchRegistryForPathInternal(HKEY root, const std::wstring& subkey,
                 if (RegEnumValueW(hKey, index, nameBuf, &nameLen, nullptr, &typeV, reinterpret_cast<LPBYTE>(data.data()), &ds) == ERROR_SUCCESS) {
                     std::wstring val(data.data());
                     if (ContainsIC(val, pathLower)) {
-                        out.push_back(L"HKCR\\" + subkey + L" [" + valueName + L"] = " + val);
+                        out.push_back(rootLabel + L"\\" + subkey + L" [" + valueName + L"] = " + val);
                     }
                 }
             }
@@ -311,7 +313,7 @@ static void SearchRegistryForPathInternal(HKEY root, const std::wstring& subkey,
         if (rr == ERROR_SUCCESS) {
             std::wstring child = subkey.empty() ? std::wstring(subName, subNameLen)
                                                 : subkey + L"\\" + std::wstring(subName, subNameLen);
-            SearchRegistryForPathInternal(root, child, pathLower, opt, depth + 1, visited, out);
+            SearchRegistryForPathInternal(root, child, pathLower, rootLabel, opt, depth + 1, visited, out);
         }
         ++subIndex;
         if (visited > opt.maxNodes) break;
@@ -320,10 +322,10 @@ static void SearchRegistryForPathInternal(HKEY root, const std::wstring& subkey,
     RegCloseKey(hKey);
 }
 
-static void SearchRegistryForPath(HKEY root, const std::wstring& subkey, const std::wstring& pathLower,
+static void SearchRegistryForPath(HKEY root, const std::wstring& rootLabel, const std::wstring& subkey, const std::wstring& pathLower,
                                   const RegSearchOptions& opt, std::vector<std::wstring>& out) {
     int visited = 0;
-    SearchRegistryForPathInternal(root, subkey, pathLower, opt, 0, visited, out);
+    SearchRegistryForPathInternal(root, subkey, pathLower, rootLabel, opt, 0, visited, out);
 }
 
 static void ListRegistryWritesForDll(const std::wstring& dllPath, HWND hLog) {
@@ -345,10 +347,33 @@ static void ListRegistryWritesForDll(const std::wstring& dllPath, HWND hLog) {
 
     // Scan HKCR\CLSID and HKCR\TypeLib for references to the DLL path (both 64-bit and 32-bit views)
     std::vector<std::wstring> tmp;
-    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"CLSID", pathLower, opt64, tmp); addUnique(tmp);
-    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"TypeLib", pathLower, opt64, tmp); addUnique(tmp);
-    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"CLSID", pathLower, opt32, tmp); addUnique(tmp);
-    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"TypeLib", pathLower, opt32, tmp); addUnique(tmp);
+    // HKCR (merged view)
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"HKCR", L"CLSID", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"HKCR", L"TypeLib", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"HKCR", L"Interface", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"HKCR", L"AppID", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"HKCR", L"CLSID", pathLower, opt32, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"HKCR", L"TypeLib", pathLower, opt32, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"HKCR", L"Interface", pathLower, opt32, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"HKCR", L"AppID", pathLower, opt32, tmp); addUnique(tmp);
+    // HKLM\SOFTWARE\Classes (machine)
+    tmp.clear(); SearchRegistryForPath(HKEY_LOCAL_MACHINE, L"HKLM\\SOFTWARE\\Classes", L"SOFTWARE\\Classes\\CLSID", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_LOCAL_MACHINE, L"HKLM\\SOFTWARE\\Classes", L"SOFTWARE\\Classes\\TypeLib", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_LOCAL_MACHINE, L"HKLM\\SOFTWARE\\Classes", L"SOFTWARE\\Classes\\Interface", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_LOCAL_MACHINE, L"HKLM\\SOFTWARE\\Classes", L"SOFTWARE\\Classes\\AppID", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_LOCAL_MACHINE, L"HKLM\\SOFTWARE\\Classes", L"SOFTWARE\\Classes\\CLSID", pathLower, opt32, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_LOCAL_MACHINE, L"HKLM\\SOFTWARE\\Classes", L"SOFTWARE\\Classes\\TypeLib", pathLower, opt32, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_LOCAL_MACHINE, L"HKLM\\SOFTWARE\\Classes", L"SOFTWARE\\Classes\\Interface", pathLower, opt32, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_LOCAL_MACHINE, L"HKLM\\SOFTWARE\\Classes", L"SOFTWARE\\Classes\\AppID", pathLower, opt32, tmp); addUnique(tmp);
+    // HKCU\Software\Classes (per-user)
+    tmp.clear(); SearchRegistryForPath(HKEY_CURRENT_USER, L"HKCU\\Software\\Classes", L"Software\\Classes\\CLSID", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CURRENT_USER, L"HKCU\\Software\\Classes", L"Software\\Classes\\TypeLib", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CURRENT_USER, L"HKCU\\Software\\Classes", L"Software\\Classes\\Interface", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CURRENT_USER, L"HKCU\\Software\\Classes", L"Software\\Classes\\AppID", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CURRENT_USER, L"HKCU\\Software\\Classes", L"Software\\Classes\\CLSID", pathLower, opt32, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CURRENT_USER, L"HKCU\\Software\\Classes", L"Software\\Classes\\TypeLib", pathLower, opt32, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CURRENT_USER, L"HKCU\\Software\\Classes", L"Software\\Classes\\Interface", pathLower, opt32, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CURRENT_USER, L"HKCU\\Software\\Classes", L"Software\\Classes\\AppID", pathLower, opt32, tmp); addUnique(tmp);
 
     if (results.empty()) {
         AppendLog(hLog, L"[Info] No registry entries referencing this DLL were found under HKCR\\CLSID or HKCR\\TypeLib.");
@@ -588,6 +613,8 @@ static void LayoutControls(HWND hWnd, AppState* app, int cx, int cy) {
     MoveWindow(app->hRegBtn, x, y, btnW, btnH, TRUE);
     x += btnW + pad;
     MoveWindow(app->hRegElevBtn, x, y, btnW, btnH, TRUE);
+    x += btnW + pad;
+    MoveWindow(app->hClearLogBtn, x, y, btnW, btnH, TRUE);
 
     // List occupies upper half area
     int topAreaY = y + btnH + pad;
@@ -622,6 +649,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         app->hRegElevBtn = CreateWindowW(L"BUTTON", L"Register (Elevated)",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_DISABLED,
             0, 0, 0, 0, hWnd, (HMENU)IDC_REG_ELEV, GetModuleHandleW(nullptr), nullptr);
+
+        app->hClearLogBtn = CreateWindowW(L"BUTTON", L"Clear Log",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            0, 0, 0, 0, hWnd, (HMENU)IDC_CLEAR_LOG, GetModuleHandleW(nullptr), nullptr);
 
         app->hList = CreateWindowW(WC_LISTVIEWW, L"",
             WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | WS_TABSTOP | WS_BORDER,
@@ -690,6 +721,13 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         case IDC_REG_ELEV: {
             RegisterSelectedDllElevated(hWnd, app);
+            return 0;
+        }
+        case IDC_CLEAR_LOG: {
+            // Temporarily disable read-only to clear the log edit box
+            SendMessageW(app->hLog, EM_SETREADONLY, FALSE, 0);
+            SetWindowTextW(app->hLog, L"");
+            SendMessageW(app->hLog, EM_SETREADONLY, TRUE, 0);
             return 0;
         }
         default: break;
