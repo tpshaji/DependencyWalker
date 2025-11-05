@@ -21,6 +21,9 @@
 #define IDC_LOG          1004
 #define IDC_REG_ELEV     1005
 #define IDC_CLEAR_LOG    1006
+#define IDC_REG_DIFF     1007
+#define IDC_EXPORT_LOG   1008
+#define IDC_UNREG        1009
 
 // Window class name
 static const wchar_t* kClassName = L"DependencyExplorerWnd";
@@ -35,6 +38,13 @@ struct AppState {
     HWND hRegBtn  = nullptr;
     HWND hRegElevBtn = nullptr;
     HWND hClearLogBtn = nullptr;
+    HWND hRegDiffBtn = nullptr;
+    HWND hExportLogBtn = nullptr;
+    HWND hUnregBtn = nullptr;
+
+    // Registry snapshots around registration (before/after)
+    std::vector<std::wstring> regSnapBefore;
+    std::vector<std::wstring> regSnapAfter;
 };
 
 static std::wstring DirName(const std::wstring& path) {
@@ -386,6 +396,234 @@ static void ListRegistryWritesForDll(const std::wstring& dllPath, HWND hLog) {
     }
 }
 
+static void CollectProgIDsForDllFromHKCR(const std::wstring& dllPathLower, REGSAM wow64View, std::unordered_set<std::wstring>& outProgIDs) {
+    HKEY hClsid = nullptr;
+    if (RegOpenKeyExW(HKEY_CLASSES_ROOT, L"CLSID", 0, KEY_READ | KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE | wow64View, &hClsid) != ERROR_SUCCESS) {
+        return;
+    }
+    DWORD index = 0;
+    for (;;) {
+        wchar_t subName[256];
+        DWORD subNameLen = 256;
+        FILETIME ft{};
+        LONG r = RegEnumKeyExW(hClsid, index, subName, &subNameLen, nullptr, nullptr, nullptr, &ft);
+        if (r == ERROR_NO_MORE_ITEMS) break;
+        if (r == ERROR_SUCCESS) {
+            std::wstring guid(subName, subNameLen);
+            std::wstring inprocKey = L"CLSID\\" + guid + L"\\InprocServer32";
+            HKEY hInproc = nullptr;
+            if (RegOpenKeyExW(HKEY_CLASSES_ROOT, inprocKey.c_str(), 0, KEY_READ | KEY_QUERY_VALUE | wow64View, &hInproc) == ERROR_SUCCESS) {
+                DWORD type = 0;
+                DWORD cb = 0;
+                if (RegQueryValueExW(hInproc, nullptr, nullptr, &type, nullptr, &cb) == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ) && cb > sizeof(wchar_t)) {
+                    std::vector<wchar_t> buf(cb / sizeof(wchar_t) + 1);
+                    if (RegQueryValueExW(hInproc, nullptr, nullptr, &type, reinterpret_cast<LPBYTE>(buf.data()), &cb) == ERROR_SUCCESS) {
+                        std::wstring path = buf.data();
+                        if (ContainsIC(path, dllPathLower)) {
+                            // Get ProgID
+                            RegCloseKey(hInproc);
+                            std::wstring progidKey = L"CLSID\\" + guid;
+                            HKEY hGuid = nullptr;
+                            if (RegOpenKeyExW(HKEY_CLASSES_ROOT, progidKey.c_str(), 0, KEY_READ | KEY_QUERY_VALUE | wow64View, &hGuid) == ERROR_SUCCESS) {
+                                DWORD type2 = 0, cb2 = 0;
+                                if (RegQueryValueExW(hGuid, L"ProgID", nullptr, &type2, nullptr, &cb2) == ERROR_SUCCESS && (type2 == REG_SZ || type2 == REG_EXPAND_SZ) && cb2 > sizeof(wchar_t)) {
+                                    std::vector<wchar_t> buf2(cb2 / sizeof(wchar_t) + 1);
+                                    if (RegQueryValueExW(hGuid, L"ProgID", nullptr, &type2, reinterpret_cast<LPBYTE>(buf2.data()), &cb2) == ERROR_SUCCESS) {
+                                        std::wstring progid = buf2.data();
+                                        if (!progid.empty()) outProgIDs.insert(progid);
+                                    }
+                                }
+                                RegCloseKey(hGuid);
+                            }
+                            index++;
+                            continue;
+                        }
+                    }
+                }
+                RegCloseKey(hInproc);
+            }
+        }
+        ++index;
+    }
+    RegCloseKey(hClsid);
+}
+
+static void ListOfficeLoadBehaviorForDll(const std::wstring& dllPath, HWND hLog) {
+    if (!hLog || dllPath.empty()) return;
+    std::wstring pathLower = ToLower(dllPath);
+
+    // Collect ProgIDs for CLSIDs whose InprocServer32 points to this DLL
+    std::unordered_set<std::wstring> progIds;
+    CollectProgIDsForDllFromHKCR(pathLower, KEY_WOW64_64KEY, progIds);
+    CollectProgIDsForDllFromHKCR(pathLower, KEY_WOW64_32KEY, progIds);
+
+    if (progIds.empty()) {
+        AppendLog(hLog, L"[Info] No COM ProgID associated with this DLL via InprocServer32; skipping Office LoadBehavior scan.");
+        return;
+    }
+
+    const std::wstring officeBase = L"Software\\Microsoft\\Office\\";
+    const std::vector<std::wstring> apps = { L"Outlook", L"Excel", L"Word", L"PowerPoint", L"Visio", L"Project", L"Access", L"OneNote", L"Publisher" };
+
+    auto scanRoot = [&](HKEY root, const std::wstring& rootLabel, REGSAM view) {
+        for (const auto& app : apps) {
+            for (const auto& progId : progIds) {
+                std::wstring subkey = officeBase + app + L"\\Addins\\" + progId;
+                HKEY hKey = nullptr;
+                LONG rc = RegOpenKeyExW(root, subkey.c_str(), 0, KEY_READ | KEY_QUERY_VALUE | view, &hKey);
+                if (rc != ERROR_SUCCESS) continue;
+
+                DWORD type = 0;
+                DWORD cb = sizeof(DWORD);
+                DWORD dw = 0;
+                if (RegQueryValueExW(hKey, L"LoadBehavior", nullptr, &type, reinterpret_cast<LPBYTE>(&dw), &cb) == ERROR_SUCCESS && type == REG_DWORD) {
+                    std::wstringstream ss;
+                    ss << L"[Info] " << rootLabel << L"\\" << subkey << L"\\LoadBehavior = " << dw << L" (0x" << std::hex << std::uppercase << dw << L")";
+                    AppendLog(hLog, ss.str());
+                }
+                RegCloseKey(hKey);
+            }
+        }
+    };
+
+    AppendLog(hLog, L"[Info] Checking Office Add-ins LoadBehavior for related ProgIDs...");
+    scanRoot(HKEY_CURRENT_USER, L"HKCU", KEY_WOW64_64KEY);
+    scanRoot(HKEY_CURRENT_USER, L"HKCU", KEY_WOW64_32KEY);
+    scanRoot(HKEY_LOCAL_MACHINE, L"HKLM", KEY_WOW64_64KEY);
+    scanRoot(HKEY_LOCAL_MACHINE, L"HKLM", KEY_WOW64_32KEY);
+}
+
+static void TakeRegistrySnapshotForDll(const std::wstring& dllPath, std::vector<std::wstring>& out) {
+    out.clear();
+    if (dllPath.empty()) return;
+    std::wstring pathLower = ToLower(dllPath);
+
+    std::vector<std::wstring> tmp;
+    std::unordered_set<std::wstring> seen;
+    auto addUnique = [&](const std::vector<std::wstring>& v) {
+        for (const auto& s : v) {
+            if (seen.insert(s).second) out.push_back(s);
+        }
+    };
+
+    RegSearchOptions opt64{ KEY_WOW64_64KEY, 4, 20000 };
+    RegSearchOptions opt32{ KEY_WOW64_32KEY, 4, 20000 };
+
+    // HKCR (merged)
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"HKCR", L"CLSID", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"HKCR", L"TypeLib", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"HKCR", L"Interface", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"HKCR", L"AppID", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"HKCR", L"CLSID", pathLower, opt32, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"HKCR", L"TypeLib", pathLower, opt32, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"HKCR", L"Interface", pathLower, opt32, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CLASSES_ROOT, L"HKCR", L"AppID", pathLower, opt32, tmp); addUnique(tmp);
+
+    // HKLM\SOFTWARE\Classes
+    tmp.clear(); SearchRegistryForPath(HKEY_LOCAL_MACHINE, L"HKLM\\SOFTWARE\\Classes", L"SOFTWARE\\Classes\\CLSID", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_LOCAL_MACHINE, L"HKLM\\SOFTWARE\\Classes", L"SOFTWARE\\Classes\\TypeLib", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_LOCAL_MACHINE, L"HKLM\\SOFTWARE\\Classes", L"SOFTWARE\\Classes\\Interface", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_LOCAL_MACHINE, L"HKLM\\SOFTWARE\\Classes", L"SOFTWARE\\Classes\\AppID", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_LOCAL_MACHINE, L"HKLM\\SOFTWARE\\Classes", L"SOFTWARE\\Classes\\CLSID", pathLower, opt32, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_LOCAL_MACHINE, L"HKLM\\SOFTWARE\\Classes", L"SOFTWARE\\Classes\\TypeLib", pathLower, opt32, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_LOCAL_MACHINE, L"HKLM\\SOFTWARE\\Classes", L"SOFTWARE\\Classes\\Interface", pathLower, opt32, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_LOCAL_MACHINE, L"HKLM\\SOFTWARE\\Classes", L"SOFTWARE\\Classes\\AppID", pathLower, opt32, tmp); addUnique(tmp);
+
+    // HKCU\Software\Classes
+    tmp.clear(); SearchRegistryForPath(HKEY_CURRENT_USER, L"HKCU\\Software\\Classes", L"Software\\Classes\\CLSID", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CURRENT_USER, L"HKCU\\Software\\Classes", L"Software\\Classes\\TypeLib", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CURRENT_USER, L"HKCU\\Software\\Classes", L"Software\\Classes\\Interface", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CURRENT_USER, L"HKCU\\Software\\Classes", L"Software\\Classes\\AppID", pathLower, opt64, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CURRENT_USER, L"HKCU\\Software\\Classes", L"Software\\Classes\\CLSID", pathLower, opt32, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CURRENT_USER, L"HKCU\\Software\\Classes", L"Software\\Classes\\TypeLib", pathLower, opt32, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CURRENT_USER, L"HKCU\\Software\\Classes", L"Software\\Classes\\Interface", pathLower, opt32, tmp); addUnique(tmp);
+    tmp.clear(); SearchRegistryForPath(HKEY_CURRENT_USER, L"HKCU\\Software\\Classes", L"Software\\Classes\\AppID", pathLower, opt32, tmp); addUnique(tmp);
+}
+
+static void ComputeAndLogRegistryDiff(HWND hLog, const std::vector<std::wstring>& before, const std::vector<std::wstring>& after) {
+    std::unordered_set<std::wstring> bset(before.begin(), before.end());
+    std::unordered_set<std::wstring> aset(after.begin(), after.end());
+
+    std::vector<std::wstring> added, removed;
+    for (const auto& s : after) if (!bset.count(s)) added.push_back(s);
+    for (const auto& s : before) if (!aset.count(s)) removed.push_back(s);
+
+    if (added.empty() && removed.empty()) {
+        AppendLog(hLog, L"[Diff] No registry differences detected between snapshots.");
+        return;
+    }
+    std::wstringstream ss;
+    ss << L"[Diff] Added: " << added.size() << L", Removed: " << removed.size();
+    AppendLog(hLog, ss.str());
+
+    if (!added.empty()) {
+        AppendLog(hLog, L"[Diff] Added entries:");
+        for (const auto& s : added) AppendLog(hLog, L"  + " + s);
+    }
+    if (!removed.empty()) {
+        AppendLog(hLog, L"[Diff] Removed entries:");
+        for (const auto& s : removed) AppendLog(hLog, L"  - " + s);
+    }
+}
+
+static void ExportLogToFile(HWND hWnd, HWND hLog) {
+    if (!hLog) return;
+
+    // Get the log text
+    int len = GetWindowTextLengthW(hLog);
+    std::wstring text;
+    text.resize(len);
+    if (len > 0) {
+        GetWindowTextW(hLog, text.data(), len + 1);
+        // Adjust size because std::wstring::data() doesn't set null terminator count
+        text.resize(wcslen(text.c_str()));
+    }
+
+    IFileSaveDialog* pDlg = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pDlg));
+    if (FAILED(hr)) return;
+
+    COMDLG_FILTERSPEC filters[] = {
+        { L"Text Files (*.txt)", L"*.txt" },
+        { L"All Files (*.*)", L"*.*" }
+    };
+    pDlg->SetFileTypes(ARRAYSIZE(filters), filters);
+    pDlg->SetDefaultExtension(L"txt");
+    pDlg->SetTitle(L"Export Log");
+
+    hr = pDlg->Show(hWnd);
+    if (FAILED(hr)) {
+        pDlg->Release();
+        return;
+    }
+
+    IShellItem* pItem = nullptr;
+    hr = pDlg->GetResult(&pItem);
+    if (FAILED(hr)) {
+        pDlg->Release();
+        return;
+    }
+
+    PWSTR psz = nullptr;
+    hr = pItem->GetDisplayName(SIGDN_FILESYSPATH, &psz);
+    if (SUCCEEDED(hr) && psz) {
+        // Write UTF-16LE with BOM
+        HANDLE hFile = CreateFileW(psz, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            const WCHAR bom = 0xFEFF;
+            DWORD written = 0;
+            WriteFile(hFile, &bom, sizeof(bom), &written, nullptr);
+            if (!text.empty()) {
+                WriteFile(hFile, text.c_str(), static_cast<DWORD>(text.size() * sizeof(wchar_t)), &written, nullptr);
+            }
+            CloseHandle(hFile);
+        }
+        CoTaskMemFree(psz);
+    }
+    pItem->Release();
+    pDlg->Release();
+}
+
 static void PopulateDependencies(HWND hWnd, AppState* app) {
     if (!app || app->selectedDllPath.empty()) return;
 
@@ -458,6 +696,10 @@ static void RegisterSelectedDll(HWND hWnd, AppState* app) {
     }
 
     AppendLog(app->hLog, L"[Info] " + note);
+    // Take registry snapshot (before)
+    app->regSnapBefore.clear();
+    TakeRegistrySnapshotForDll(app->selectedDllPath, app->regSnapBefore);
+
     std::wstring cmdline = L"\"" + regsvr + L"\" /s \"" + app->selectedDllPath + L"\"";
     AppendLog(app->hLog, L"[Start] " + TimeStamp() + L" Running: " + cmdline);
 
@@ -499,6 +741,12 @@ static void RegisterSelectedDll(HWND hWnd, AppState* app) {
         AppendLog(app->hLog, L"[Success] Registration completed.");
         AppendLog(app->hLog, L"[Info] Scanning registry for entries referencing this DLL...");
         ListRegistryWritesForDll(app->selectedDllPath, app->hLog);
+        ListOfficeLoadBehaviorForDll(app->selectedDllPath, app->hLog);
+
+        // Take registry snapshot (after)
+        app->regSnapAfter.clear();
+        TakeRegistrySnapshotForDll(app->selectedDllPath, app->regSnapAfter);
+        AppendLog(app->hLog, L"[Info] Captured registry snapshots (before/after). Use 'Registry Update' to view diff.");
     } else {
         AppendLog(app->hLog, L"[Warning] Registration failed or returned non-zero.");
         AppendLog(app->hLog, L"          If this is due to permissions, try running the app elevated.");
@@ -519,6 +767,10 @@ static void RegisterSelectedDllElevated(HWND hWnd, AppState* app) {
     }
 
     AppendLog(app->hLog, L"[Info] (Elevated) " + note);
+    // Take registry snapshot (before)
+    app->regSnapBefore.clear();
+    TakeRegistrySnapshotForDll(app->selectedDllPath, app->regSnapBefore);
+
     std::wstring params = L"/s \"" + app->selectedDllPath + L"\"";
 
     SHELLEXECUTEINFOW sei{};
@@ -554,6 +806,12 @@ static void RegisterSelectedDllElevated(HWND hWnd, AppState* app) {
             AppendLog(app->hLog, L"[Success] Registration completed (elevated).");
             AppendLog(app->hLog, L"[Info] Scanning registry for entries referencing this DLL...");
             ListRegistryWritesForDll(app->selectedDllPath, app->hLog);
+            ListOfficeLoadBehaviorForDll(app->selectedDllPath, app->hLog);
+
+            // Take registry snapshot (after)
+            app->regSnapAfter.clear();
+            TakeRegistrySnapshotForDll(app->selectedDllPath, app->regSnapAfter);
+            AppendLog(app->hLog, L"[Info] Captured registry snapshots (before/after). Use 'Registry Update' to view diff.");
         } else {
             AppendLog(app->hLog, L"[Warning] Registration failed or returned non-zero (elevated).");
         }
@@ -614,7 +872,13 @@ static void LayoutControls(HWND hWnd, AppState* app, int cx, int cy) {
     x += btnW + pad;
     MoveWindow(app->hRegElevBtn, x, y, btnW, btnH, TRUE);
     x += btnW + pad;
+    MoveWindow(app->hUnregBtn, x, y, btnW, btnH, TRUE);
+    x += btnW + pad;
     MoveWindow(app->hClearLogBtn, x, y, btnW, btnH, TRUE);
+    x += btnW + pad;
+    MoveWindow(app->hRegDiffBtn, x, y, btnW, btnH, TRUE);
+    x += btnW + pad;
+    MoveWindow(app->hExportLogBtn, x, y, btnW, btnH, TRUE);
 
     // List occupies upper half area
     int topAreaY = y + btnH + pad;
@@ -650,9 +914,21 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_DISABLED,
             0, 0, 0, 0, hWnd, (HMENU)IDC_REG_ELEV, GetModuleHandleW(nullptr), nullptr);
 
+        app->hUnregBtn = CreateWindowW(L"BUTTON", L"Unregister DLL",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_DISABLED,
+            0, 0, 0, 0, hWnd, (HMENU)IDC_UNREG, GetModuleHandleW(nullptr), nullptr);
+
         app->hClearLogBtn = CreateWindowW(L"BUTTON", L"Clear Log",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
             0, 0, 0, 0, hWnd, (HMENU)IDC_CLEAR_LOG, GetModuleHandleW(nullptr), nullptr);
+
+        app->hRegDiffBtn = CreateWindowW(L"BUTTON", L"Registry Update",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            0, 0, 0, 0, hWnd, (HMENU)IDC_REG_DIFF, GetModuleHandleW(nullptr), nullptr);
+
+        app->hExportLogBtn = CreateWindowW(L"BUTTON", L"Export Log...",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            0, 0, 0, 0, hWnd, (HMENU)IDC_EXPORT_LOG, GetModuleHandleW(nullptr), nullptr);
 
         app->hList = CreateWindowW(WC_LISTVIEWW, L"",
             WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | WS_TABSTOP | WS_BORDER,
@@ -710,6 +986,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                     AppendLog(app->hLog, L"[Info] Selected: " + app->selectedDllPath + L" (" + mstr + L")");
                     EnableWindow(app->hRegBtn, mt != peutils::MachineType::Unknown);
                     EnableWindow(app->hRegElevBtn, mt != peutils::MachineType::Unknown);
+                    EnableWindow(app->hUnregBtn, mt != peutils::MachineType::Unknown);
                 }
                 PopulateDependencies(hWnd, app);
             }
@@ -728,6 +1005,77 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             SendMessageW(app->hLog, EM_SETREADONLY, FALSE, 0);
             SetWindowTextW(app->hLog, L"");
             SendMessageW(app->hLog, EM_SETREADONLY, TRUE, 0);
+            return 0;
+        }
+        case IDC_UNREG: {
+            if (!app->selectedDllPath.empty()) {
+                std::wstring note, err;
+                std::wstring regsvr = peutils::GetRegsvr32PathForTarget(app->selectedDllMachine, note, err);
+                if (regsvr.empty()) {
+                    AppendLog(app->hLog, L"[Error] regsvr32 path selection failed: " + err);
+                    return 0;
+                }
+                AppendLog(app->hLog, L"[Info] " + note);
+                // Snapshot before
+                app->regSnapBefore.clear();
+                TakeRegistrySnapshotForDll(app->selectedDllPath, app->regSnapBefore);
+
+                std::wstring cmdline = L"\"" + regsvr + L"\" /u /s \"" + app->selectedDllPath + L"\"";
+                AppendLog(app->hLog, L"[Start] " + TimeStamp() + L" Running: " + cmdline);
+
+                STARTUPINFOW si{}; si.cb = sizeof(si);
+                PROCESS_INFORMATION pi{};
+                std::wstring mutableCmd = cmdline;
+                BOOL ok = CreateProcessW(
+                    regsvr.c_str(),
+                    mutableCmd.data(),
+                    nullptr, nullptr, FALSE,
+                    CREATE_NO_WINDOW,
+                    nullptr, nullptr,
+                    &si, &pi
+                );
+                if (!ok) {
+                    DWORD gle = GetLastError();
+                    std::wstringstream sse;
+                    sse << L"[Error] CreateProcess (unregister) failed. GLE=" << gle;
+                    AppendLog(app->hLog, sse.str());
+                    return 0;
+                }
+                WaitForSingleObject(pi.hProcess, INFINITE);
+                DWORD exitCode = 0;
+                GetExitCodeProcess(pi.hProcess, &exitCode);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+
+                std::wstringstream sse;
+                sse << L"[End] " << TimeStamp() << L" Unregister ExitCode=" << exitCode;
+                AppendLog(app->hLog, sse.str());
+
+                if (exitCode == 0) {
+                    AppendLog(app->hLog, L"[Success] Unregistration completed.");
+                    // Snapshot after
+                    app->regSnapAfter.clear();
+                    TakeRegistrySnapshotForDll(app->selectedDllPath, app->regSnapAfter);
+                    AppendLog(app->hLog, L"[Info] Captured registry snapshots (before/after). Use 'Registry Update' to view diff.");
+                } else {
+                    AppendLog(app->hLog, L"[Warning] Unregistration returned non-zero.");
+                }
+            } else {
+                AppendLog(app->hLog, L"[Error] No DLL selected.");
+            }
+            return 0;
+        }
+        case IDC_REG_DIFF: {
+            if (!app->regSnapBefore.empty() || !app->regSnapAfter.empty()) {
+                AppendLog(app->hLog, L"[Info] Computing registry diff (before vs after)...");
+                ComputeAndLogRegistryDiff(app->hLog, app->regSnapBefore, app->regSnapAfter);
+            } else {
+                AppendLog(app->hLog, L"[Info] No snapshots available. Perform a registration first.");
+            }
+            return 0;
+        }
+        case IDC_EXPORT_LOG: {
+            ExportLogToFile(hWnd, app->hLog);
             return 0;
         }
         default: break;
