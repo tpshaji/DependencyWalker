@@ -1,0 +1,10 @@
+{
+  "cmake.useCMakePresets": "always",
+  "cmake.configureOnOpen": true,
+  "cmake.configurePreset": "vs2022-x64",
+  "cmake.buildPreset": "vs2022-x64-Release",
+  "cmake.generator": "Visual Studio 17 2022",
+  "cmake.sourceDirectory": "${workspaceFolder}",
+  "cmake.buildDirectory": "${workspaceFolder}/build/vs2022-x64",
+  "cmake.cmakePath": "C:/Program Files/CMake/bin/cmake.exe"
+}

@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Research/DependencyWalker/build/vs2022-x64/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

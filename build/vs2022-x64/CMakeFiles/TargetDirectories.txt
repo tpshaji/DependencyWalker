@@ -1,0 +1,3 @@
+C:/Research/DependencyWalker/build/vs2022-x64/CMakeFiles/DependencyExplorer.dir
+C:/Research/DependencyWalker/build/vs2022-x64/CMakeFiles/ALL_BUILD.dir
+C:/Research/DependencyWalker/build/vs2022-x64/CMakeFiles/ZERO_CHECK.dir
