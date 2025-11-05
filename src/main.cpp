@@ -825,7 +825,7 @@ static void RegisterSelectedDll(HWND hWnd, AppState* app) {
         // Take registry snapshot (after)
         app->regSnapAfter.clear();
         TakeRegistrySnapshotForDll(app->selectedDllPath, app->regSnapAfter);
-        AppendLog(app->hLog, L"[Info] Captured registry snapshots (before/after). Use 'Registry Update' to view diff.");
+        AppendLog(app->hLog, L"[Info] Captured registry snapshots (before/after). Use 'Show Registry diff' to view diff.");
     } else {
         AppendLog(app->hLog, L"[Warning] Registration failed or returned non-zero.");
         AppendLog(app->hLog, L"          If this is due to permissions, try running the app elevated.");
@@ -891,7 +891,7 @@ static void RegisterSelectedDllElevated(HWND hWnd, AppState* app) {
             // Take registry snapshot (after)
             app->regSnapAfter.clear();
             TakeRegistrySnapshotForDll(app->selectedDllPath, app->regSnapAfter);
-            AppendLog(app->hLog, L"[Info] Captured registry snapshots (before/after). Use 'Registry Update' to view diff.");
+            AppendLog(app->hLog, L"[Info] Captured registry snapshots (before/after). Use 'Show Registry diff' to view diff.");
         } else {
             AppendLog(app->hLog, L"[Warning] Registration failed or returned non-zero (elevated).");
             DiagnoseRegistrationFailure(hWnd, app->hLog, app->selectedDllPath, /*isUnregister=*/false);
@@ -1003,7 +1003,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
             0, 0, 0, 0, hWnd, (HMENU)IDC_CLEAR_LOG, GetModuleHandleW(nullptr), nullptr);
 
-        app->hRegDiffBtn = CreateWindowW(L"BUTTON", L"Registry Update",
+        app->hRegDiffBtn = CreateWindowW(L"BUTTON", L"Show Registry diff",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
             0, 0, 0, 0, hWnd, (HMENU)IDC_REG_DIFF, GetModuleHandleW(nullptr), nullptr);
 
@@ -1137,7 +1137,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                     // Snapshot after
                     app->regSnapAfter.clear();
                     TakeRegistrySnapshotForDll(app->selectedDllPath, app->regSnapAfter);
-                    AppendLog(app->hLog, L"[Info] Captured registry snapshots (before/after). Use 'Registry Update' to view diff.");
+                    AppendLog(app->hLog, L"[Info] Captured registry snapshots (before/after). Use 'Show Registry diff' to view diff.");
                 } else {
                     AppendLog(app->hLog, L"[Warning] Unregistration returned non-zero.");
                     DiagnoseRegistrationFailure(hWnd, app->hLog, app->selectedDllPath, /*isUnregister=*/true);
